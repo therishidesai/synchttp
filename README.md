@@ -4,6 +4,8 @@
 
 It currently focuses on a single-threaded HTTP/1.1 server core with strict request parsing, buffered request bodies, and a minimal exact-path router.
 
+NOTE: This was entirely done by opencode + GPT5.4.
+
 ## Install
 
 Add the crate with:
