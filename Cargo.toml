@@ -2,6 +2,11 @@
 name = "synchttp"
 version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
+description = "A single threaded sync HTTP/1 server."
+homepage = "https://github.com/therishidesai/synchttp"
+repository = "https://github.com/therishidesai/synchttp"
+readme = "README.md"
 
 [dependencies]
 mio = { version = "0.8", features = ["net", "os-poll"] }
