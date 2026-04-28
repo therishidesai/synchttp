@@ -1,6 +1,6 @@
 [package]
 name = "synchttp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "A single threaded sync HTTP/1 server."
