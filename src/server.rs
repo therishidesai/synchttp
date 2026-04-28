@@ -220,6 +220,11 @@ impl Server {
                     connection.queue_write(bytes);
                     connection.close_after_flush |= close_connection;
 
+                    if close_connection {
+                        connection.read_buf.clear();
+                        break;
+                    }
+
                     if connection.pending_write_bytes() > self.config.max_pending_write_bytes {
                         connection.close_after_flush = true;
                         break;

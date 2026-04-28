@@ -320,6 +320,25 @@ mod tests {
     use crate::types::{ParseError, ServerConfig, Version};
     use proptest::prelude::*;
 
+    fn build_request(
+        method: &str,
+        target: &str,
+        version: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut request = format!("{} {} {}\r\n", method, target, version).into_bytes();
+        for (name, value) in headers {
+            request.extend_from_slice(name.as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value.as_bytes());
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+        request
+    }
+
     #[test]
     fn parses_simple_get_request() {
         let config = ServerConfig::default();
@@ -418,6 +437,159 @@ mod tests {
             prop_assert_eq!(direct.request.path(), parsed.request.path());
             prop_assert_eq!(direct.request.body(), parsed.request.body());
             prop_assert_eq!(direct.consumed, parsed.consumed);
+        }
+
+        #[test]
+        fn complete_valid_requests_consume_all_bytes_and_prefixes_need_more_data(
+            method in prop_oneof![Just("GET".to_string()), Just("POST".to_string()), Just("PUT".to_string())],
+            path in "(/[a-z]{0,8}){1,3}",
+            body in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let request = build_request(
+                &method,
+                &path,
+                "HTTP/1.1",
+                &[
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                &body,
+            );
+            let config = ServerConfig::default();
+            let parsed = try_parse_request(&request, &config).unwrap().unwrap();
+
+            prop_assert_eq!(parsed.consumed, request.len());
+            prop_assert_eq!(parsed.request.body(), body.as_slice());
+
+            for prefix_len in 0..request.len() {
+                let prefix = &request[..prefix_len];
+                prop_assert!(matches!(try_parse_request(prefix, &config), Ok(None)));
+            }
+        }
+
+        #[test]
+        fn matching_duplicate_content_length_headers_are_accepted(
+            path in "(/[a-z]{0,8}){1,3}",
+            body in proptest::collection::vec(any::<u8>(), 0..48),
+        ) {
+            let request = build_request(
+                "POST",
+                &path,
+                "HTTP/1.1",
+                &[
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                &body,
+            );
+            let config = ServerConfig::default();
+            let parsed = try_parse_request(&request, &config).unwrap().unwrap();
+
+            prop_assert_eq!(parsed.request.path(), path);
+            prop_assert_eq!(parsed.request.body(), body.as_slice());
+        }
+
+        #[test]
+        fn conflicting_content_length_headers_are_rejected(
+            path in "(/[a-z]{0,8}){1,3}",
+            first in 0usize..32,
+            second in 0usize..32,
+        ) {
+            prop_assume!(first != second);
+            let request = build_request(
+                "POST",
+                &path,
+                "HTTP/1.1",
+                &[
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Content-Length".to_string(), first.to_string()),
+                    ("Content-Length".to_string(), second.to_string()),
+                ],
+                &[],
+            );
+            let config = ServerConfig::default();
+            let error = try_parse_request(&request, &config).unwrap_err();
+
+            prop_assert!(matches!(error, ParseError::BadRequest(_)));
+        }
+
+        #[test]
+        fn transfer_encoding_and_content_length_are_rejected_together(
+            path in "(/[a-z]{0,8}){1,3}",
+        ) {
+            let request = build_request(
+                "POST",
+                &path,
+                "HTTP/1.1",
+                &[
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                    ("Content-Length".to_string(), "0".to_string()),
+                ],
+                b"0\r\n\r\n",
+            );
+            let config = ServerConfig::default();
+            let error = try_parse_request(&request, &config).unwrap_err();
+
+            prop_assert!(matches!(error, ParseError::BadRequest(_)));
+        }
+
+        #[test]
+        fn unsupported_transfer_encoding_is_rejected(
+            path in "(/[a-z]{0,8}){1,3}",
+            body in proptest::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let request = build_request(
+                "POST",
+                &path,
+                "HTTP/1.1",
+                &[
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Transfer-Encoding".to_string(), "gzip".to_string()),
+                ],
+                &body,
+            );
+            let config = ServerConfig::default();
+            let error = try_parse_request(&request, &config).unwrap_err();
+
+            prop_assert!(matches!(error, ParseError::NotImplemented(_)));
+        }
+
+        #[test]
+        fn absolute_form_targets_normalize_to_their_path(
+            path in "(/[a-z]{0,8}){1,3}",
+        ) {
+            let target = format!("http://example.test{}?debug=true", path);
+            let request = build_request(
+                "GET",
+                &target,
+                "HTTP/1.1",
+                &[("Host".to_string(), "example.test".to_string())],
+                &[],
+            );
+            let config = ServerConfig::default();
+            let parsed = try_parse_request(&request, &config).unwrap().unwrap();
+
+            prop_assert_eq!(parsed.request.path(), path);
+            prop_assert_eq!(parsed.request.target(), target);
+        }
+
+        #[test]
+        fn http11_requires_exactly_one_host_header(
+            path in "(/[a-z]{0,8}){1,3}",
+            host_count in 0usize..4,
+        ) {
+            prop_assume!(host_count != 1);
+            let mut headers = Vec::new();
+            for index in 0..host_count {
+                headers.push(("Host".to_string(), format!("example{}.test", index)));
+            }
+            let request = build_request("GET", &path, "HTTP/1.1", &headers, &[]);
+            let config = ServerConfig::default();
+            let error = try_parse_request(&request, &config).unwrap_err();
+
+            prop_assert!(matches!(error, ParseError::BadRequest(_)));
         }
     }
 }

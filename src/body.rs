@@ -91,3 +91,124 @@ fn find_double_crlf(bytes: &[u8], start: usize) -> Option<usize> {
         .position(|window| window == b"\r\n\r\n")
         .map(|position| start + position)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_chunked_body;
+    use crate::types::{ParseError, ServerConfig};
+    use proptest::prelude::*;
+
+    fn encode_chunked(body: &[u8], split_points: &[usize], with_extensions: bool) -> Vec<u8> {
+        let mut normalized = split_points.to_vec();
+        normalized.sort_unstable();
+        normalized.dedup();
+
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+
+        for point in normalized {
+            if point <= start || point >= body.len() {
+                continue;
+            }
+            chunks.push(&body[start..point]);
+            start = point;
+        }
+
+        if start < body.len() {
+            chunks.push(&body[start..]);
+        }
+
+        let mut encoded = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut line = format!("{:X}", chunk.len());
+            if with_extensions && index % 2 == 0 {
+                line.push_str(";test=value");
+            }
+            encoded.extend_from_slice(line.as_bytes());
+            encoded.extend_from_slice(b"\r\n");
+            encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(b"\r\n");
+        }
+
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        encoded
+    }
+
+    proptest! {
+        #[test]
+        fn chunked_round_trip_preserves_body(
+            body in proptest::collection::vec(any::<u8>(), 0..128),
+            split_points in proptest::collection::vec(0usize..128usize, 0..12),
+            with_extensions in any::<bool>(),
+        ) {
+            let encoded = encode_chunked(&body, &split_points, with_extensions);
+            let config = ServerConfig::default().max_body_bytes(256);
+            let parsed = parse_chunked_body(&encoded, &config).unwrap().unwrap();
+
+            prop_assert_eq!(parsed.0, body);
+            prop_assert_eq!(parsed.1, encoded.len());
+        }
+
+        #[test]
+        fn chunked_round_trip_matches_incremental_delivery(
+            body in proptest::collection::vec(any::<u8>(), 0..96),
+            chunk_splits in proptest::collection::vec(0usize..96usize, 0..8),
+            delivery_splits in proptest::collection::vec(0usize..256usize, 0..10),
+            with_extensions in any::<bool>(),
+        ) {
+            let encoded = encode_chunked(&body, &chunk_splits, with_extensions);
+            let config = ServerConfig::default().max_body_bytes(256);
+            let direct = parse_chunked_body(&encoded, &config).unwrap().unwrap();
+
+            let mut buffer = Vec::new();
+            let mut offset = 0usize;
+            let mut incremental = None;
+            let mut delivery_splits = delivery_splits;
+            delivery_splits.push(encoded.len());
+            delivery_splits.sort_unstable();
+            delivery_splits.dedup();
+
+            for point in delivery_splits {
+                let end = point.min(encoded.len());
+                if end <= offset {
+                    continue;
+                }
+
+                buffer.extend_from_slice(&encoded[offset..end]);
+                offset = end;
+
+                if let Some(parsed) = parse_chunked_body(&buffer, &config).unwrap() {
+                    incremental = Some(parsed);
+                    break;
+                }
+            }
+
+            if incremental.is_none() && offset < encoded.len() {
+                buffer.extend_from_slice(&encoded[offset..]);
+                incremental = parse_chunked_body(&buffer, &config).unwrap();
+            }
+
+            let incremental = incremental.expect("chunked body should parse once all bytes are present");
+            prop_assert_eq!(direct.0, incremental.0);
+            prop_assert_eq!(direct.1, incremental.1);
+        }
+
+        #[test]
+        fn chunked_parser_enforces_body_limit(
+            body in proptest::collection::vec(any::<u8>(), 17..64),
+            split_points in proptest::collection::vec(0usize..64usize, 0..8),
+        ) {
+            let encoded = encode_chunked(&body, &split_points, true);
+            let config = ServerConfig::default().max_body_bytes(16);
+            let error = parse_chunked_body(&encoded, &config).unwrap_err();
+
+            prop_assert_eq!(error, ParseError::PayloadTooLarge);
+        }
+
+        #[test]
+        fn chunked_parser_never_panics_on_random_bytes(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let config = ServerConfig::default();
+            let _ = parse_chunked_body(&data, &config);
+        }
+    }
+}
