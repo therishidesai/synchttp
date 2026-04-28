@@ -9,3 +9,7 @@ mio = { version = "0.8", features = ["net", "os-poll"] }
 [dev-dependencies]
 proptest = "1.6"
 ureq = "2.12"
+
+[[bench]]
+name = "perf"
+harness = false
