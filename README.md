@@ -4,6 +4,21 @@
 
 It currently focuses on a single-threaded HTTP/1.1 server core with strict request parsing, buffered request bodies, and a minimal exact-path router.
 
+## Install
+
+Add the crate with:
+
+```bash
+cargo add synchttp
+```
+
+Or add it manually to `Cargo.toml`:
+
+```toml
+[dependencies]
+synchttp = "0.1.0"
+```
+
 ## Features
 
 - Single-threaded `mio` event loop
@@ -69,6 +84,30 @@ The test suite includes:
 - `proptest` coverage for parser and chunked-body invariants
 - randomized server-level tests over real `TcpStream` connections
 - live integration tests using both raw TCP and `ureq`
+
+## Benchmarking
+
+Run the built-in throughput and latency benchmark with:
+
+```bash
+cargo bench --bench perf
+```
+
+Useful environment variables:
+
+- `SYNCHTTP_BENCH_WARMUP_SECS`
+- `SYNCHTTP_BENCH_DURATION_SECS`
+- `SYNCHTTP_BENCH_THREADS`
+- `SYNCHTTP_BENCH_LATENCY_THREADS`
+- `SYNCHTTP_BENCH_LATENCY_SAMPLES`
+- `SYNCHTTP_BENCH_LATENCY_WARMUP`
+- `SYNCHTTP_BENCH_ECHO_BYTES`
+
+Example:
+
+```bash
+SYNCHTTP_BENCH_THREADS=16 SYNCHTTP_BENCH_DURATION_SECS=5 cargo bench --bench perf
+```
 
 ## Current Limits
 
