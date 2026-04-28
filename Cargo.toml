@@ -1,0 +1,11 @@
+[package]
+name = "synchttp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mio = { version = "0.8", features = ["net", "os-poll"] }
+
+[dev-dependencies]
+proptest = "1.6"
+ureq = "2.12"
