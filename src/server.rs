@@ -6,9 +6,10 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::conn::Connection;
 use crate::parse::try_parse_request;
-use crate::response::encode_response;
+use crate::response::{encode_response, text_response};
 use crate::router::Handler;
-use crate::types::{Method, ParseError, Response, ServerConfig, Version};
+use crate::types::{ParseError, ServerConfig};
+use crate::{Method, Version};
 
 const LISTENER_TOKEN: Token = Token(0);
 
@@ -298,10 +299,10 @@ impl Server {
         };
 
         encode_response(
-            Version::Http11,
-            &Method::new("GET"),
+            Version::HTTP_11,
+            &Method::GET,
             true,
-            Response::text(error.status_code(), body),
+            text_response(error.status_code(), body),
         )
     }
 }

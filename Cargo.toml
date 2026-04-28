@@ -9,6 +9,8 @@ repository = "https://github.com/therishidesai/synchttp"
 readme = "README.md"
 
 [dependencies]
+http = "1"
+httparse = "1"
 mio = { version = "0.8", features = ["net", "os-poll"] }
 
 [dev-dependencies]

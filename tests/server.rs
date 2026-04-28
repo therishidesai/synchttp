@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use http::header::CONTENT_TYPE;
+use http::HeaderValue;
 use proptest::prelude::*;
 use synchttp::{Response, Router, Server, ServerConfig, StatusCode};
 
@@ -32,6 +34,22 @@ impl Drop for TestServer {
             let _ = handle.join();
         }
     }
+}
+
+fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut response = Response::new(body.into().into_bytes());
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn bytes_response(status: StatusCode, body: impl Into<Vec<u8>>) -> Response {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response
 }
 
 fn spawn_server(router: Router) -> TestServer {
@@ -182,7 +200,7 @@ fn split_http_responses(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 #[test]
 fn serves_basic_route_with_ureq() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
 
     let response = ureq::get(&format!("{}/health", server.base_url()))
@@ -196,7 +214,7 @@ fn serves_basic_route_with_ureq() {
 #[test]
 fn buffers_request_body_for_handlers() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
 
@@ -210,7 +228,7 @@ fn buffers_request_body_for_handlers() {
 
 #[test]
 fn returns_bad_request_for_malformed_http() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(server.address(), b"GET / HTTP/1.1\nHost: example.test\n\n");
     let response = response_text(&response);
@@ -220,7 +238,7 @@ fn returns_bad_request_for_malformed_http() {
 
 #[test]
 fn returns_404_for_unknown_route() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -235,7 +253,7 @@ fn returns_404_for_unknown_route() {
 #[test]
 fn returns_405_and_allow_header_for_wrong_method() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -250,7 +268,7 @@ fn returns_405_and_allow_header_for_wrong_method() {
 
 #[test]
 fn rejects_missing_host_for_http11() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(server.address(), b"GET / HTTP/1.1\r\n\r\n");
     let response = response_text(&response);
@@ -260,7 +278,7 @@ fn rejects_missing_host_for_http11() {
 
 #[test]
 fn rejects_obs_fold_header_lines() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -273,7 +291,7 @@ fn rejects_obs_fold_header_lines() {
 
 #[test]
 fn accepts_absolute_form_targets() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -288,7 +306,7 @@ fn accepts_absolute_form_targets() {
 #[test]
 fn accepts_matching_duplicate_content_length_headers() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -304,7 +322,7 @@ fn accepts_matching_duplicate_content_length_headers() {
 #[test]
 fn rejects_conflicting_content_length_headers() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -319,7 +337,7 @@ fn rejects_conflicting_content_length_headers() {
 #[test]
 fn rejects_transfer_encoding_and_content_length_together() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -334,7 +352,7 @@ fn rejects_transfer_encoding_and_content_length_together() {
 #[test]
 fn accepts_chunked_request_body() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -350,7 +368,7 @@ fn accepts_chunked_request_body() {
 #[test]
 fn rejects_unsupported_transfer_encoding() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -364,7 +382,7 @@ fn rejects_unsupported_transfer_encoding() {
 
 #[test]
 fn http_10_closes_by_default_and_stops_after_first_request() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -378,7 +396,7 @@ fn http_10_closes_by_default_and_stops_after_first_request() {
 
 #[test]
 fn http_10_keep_alive_allows_multiple_requests() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -392,7 +410,7 @@ fn http_10_keep_alive_allows_multiple_requests() {
 
 #[test]
 fn connection_close_stops_after_current_response() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -407,7 +425,7 @@ fn connection_close_stops_after_current_response() {
 #[test]
 fn head_request_suppresses_body_bytes() {
     let router = Router::new().route("HEAD", "/health", |_req| {
-        Response::text(StatusCode::OK, "hello")
+        text_response(StatusCode::OK, "hello")
     });
     let server = spawn_server(router);
     let response = raw_http_exchange(
@@ -424,7 +442,7 @@ fn head_request_suppresses_body_bytes() {
 #[test]
 fn parses_requests_sent_in_small_chunks() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server(router);
     let request = b"POST /echo HTTP/1.1\r\nHost: example.test\r\nContent-Length: 7\r\n\r\npayload";
@@ -439,8 +457,8 @@ fn parses_requests_sent_in_small_chunks() {
 #[test]
 fn preserves_response_order_for_pipelined_requests() {
     let router = Router::new()
-        .get("/first", |_req| Response::text(StatusCode::OK, "first"))
-        .get("/second", |_req| Response::text(StatusCode::OK, "second"));
+        .get("/first", |_req| text_response(StatusCode::OK, "first"))
+        .get("/second", |_req| text_response(StatusCode::OK, "second"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -455,7 +473,7 @@ fn preserves_response_order_for_pipelined_requests() {
 #[test]
 fn returns_413_when_content_length_exceeds_limit() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server_with_config(router, ServerConfig::default().max_body_bytes(4));
     let response = raw_http_exchange(
@@ -470,7 +488,7 @@ fn returns_413_when_content_length_exceeds_limit() {
 #[test]
 fn returns_413_when_chunked_body_exceeds_limit() {
     let router = Router::new().post("/echo", |req| {
-        Response::bytes(StatusCode::OK, req.body().to_vec())
+        bytes_response(StatusCode::OK, req.body().to_vec())
     });
     let server = spawn_server_with_config(router, ServerConfig::default().max_body_bytes(4));
     let response = raw_http_exchange(
@@ -484,7 +502,7 @@ fn returns_413_when_chunked_body_exceeds_limit() {
 
 #[test]
 fn returns_431_when_header_count_exceeds_limit() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server_with_config(router, ServerConfig::default().max_headers(1));
     let response = raw_http_exchange(
         server.address(),
@@ -497,7 +515,7 @@ fn returns_431_when_header_count_exceeds_limit() {
 
 #[test]
 fn returns_431_when_header_block_exceeds_limit() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server_with_config(router, ServerConfig::default().max_header_bytes(32));
     let response = raw_http_exchange(
         server.address(),
@@ -510,7 +528,7 @@ fn returns_431_when_header_block_exceeds_limit() {
 
 #[test]
 fn keeps_connections_alive_for_pipelined_requests() {
-    let router = Router::new().get("/health", |_req| Response::text(StatusCode::OK, "ok"));
+    let router = Router::new().get("/health", |_req| text_response(StatusCode::OK, "ok"));
     let server = spawn_server(router);
     let response = raw_http_exchange(
         server.address(),
@@ -529,7 +547,7 @@ proptest! {
         body in proptest::collection::vec(any::<u8>(), 0..96),
         request_splits in proptest::collection::vec(0usize..256usize, 0..12),
     ) {
-        let router = Router::new().post("/echo", |req| Response::bytes(StatusCode::OK, req.body().to_vec()));
+        let router = Router::new().post("/echo", |req| bytes_response(StatusCode::OK, req.body().to_vec()));
         let server = spawn_server(router);
 
         let mut request = format!(
@@ -552,7 +570,7 @@ proptest! {
         chunk_splits in proptest::collection::vec(0usize..96usize, 0..8),
         request_splits in proptest::collection::vec(0usize..320usize, 0..14),
     ) {
-        let router = Router::new().post("/echo", |req| Response::bytes(StatusCode::OK, req.body().to_vec()));
+        let router = Router::new().post("/echo", |req| bytes_response(StatusCode::OK, req.body().to_vec()));
         let server = spawn_server(router);
 
         let mut request = b"POST /echo HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
@@ -571,10 +589,10 @@ proptest! {
         request_splits in proptest::collection::vec(0usize..512usize, 0..16),
     ) {
         let router = Router::new()
-            .get("/r0", |_req| Response::text(StatusCode::OK, "route-0"))
-            .get("/r1", |_req| Response::text(StatusCode::OK, "route-1"))
-            .get("/r2", |_req| Response::text(StatusCode::OK, "route-2"))
-            .get("/r3", |_req| Response::text(StatusCode::OK, "route-3"));
+            .get("/r0", |_req| text_response(StatusCode::OK, "route-0"))
+            .get("/r1", |_req| text_response(StatusCode::OK, "route-1"))
+            .get("/r2", |_req| text_response(StatusCode::OK, "route-2"))
+            .get("/r3", |_req| text_response(StatusCode::OK, "route-3"));
         let server = spawn_server(router);
 
         let mut request = Vec::new();

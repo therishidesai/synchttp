@@ -1,5 +1,8 @@
 use crate::body::parse_chunked_body;
-use crate::types::{Header, Method, ParseError, Request, ServerConfig, Version};
+use crate::types::{ParseError, ServerConfig};
+use crate::{Method, Request, Uri, Version};
+use http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 #[derive(Debug)]
 pub(crate) struct ParsedRequest {
@@ -12,9 +15,12 @@ pub(crate) fn try_parse_request(
     bytes: &[u8],
     config: &ServerConfig,
 ) -> Result<Option<ParsedRequest>, ParseError> {
-    let head_end = match find_double_crlf(bytes) {
-        Some(index) => index + 4,
+    let request_line_end = match find_crlf(bytes, 0) {
+        Some(end) => end,
         None => {
+            if bytes.len() > config.max_request_line_bytes {
+                return Err(ParseError::BadRequest("request line too long"));
+            }
             if bytes.len() > config.max_header_bytes {
                 return Err(ParseError::HeaderTooLarge);
             }
@@ -22,115 +28,65 @@ pub(crate) fn try_parse_request(
         }
     };
 
+    if request_line_end > config.max_request_line_bytes {
+        return Err(ParseError::BadRequest("request line too long"));
+    }
+
+    let mut raw_headers = vec![httparse::EMPTY_HEADER; config.max_headers];
+    let mut parsed = httparse::Request::new(&mut raw_headers);
+    let head_end = match parsed.parse(bytes) {
+        Ok(httparse::Status::Complete(consumed)) => consumed,
+        Ok(httparse::Status::Partial) => {
+            if bytes.len() > config.max_header_bytes {
+                return Err(ParseError::HeaderTooLarge);
+            }
+            return Ok(None);
+        }
+        Err(httparse::Error::TooManyHeaders) => return Err(ParseError::HeaderTooLarge),
+        Err(_) => return Err(ParseError::BadRequest("malformed request")),
+    };
+
     if head_end > config.max_header_bytes {
         return Err(ParseError::HeaderTooLarge);
     }
 
-    let head = &bytes[..head_end - 4];
-    let line_slices = split_head_lines(head);
-    let mut lines = line_slices.into_iter();
-    let request_line = lines
-        .next()
-        .ok_or(ParseError::BadRequest("missing request line"))?;
-
-    if request_line.len() > config.max_request_line_bytes {
-        return Err(ParseError::BadRequest("request line too long"));
-    }
-
-    let request_line = std::str::from_utf8(request_line)
-        .map_err(|_| ParseError::BadRequest("request line must be utf-8 compatible"))?;
-    let mut parts = request_line.split(' ');
-    let method = parts
-        .next()
-        .ok_or(ParseError::BadRequest("missing method"))?;
-    let target = parts
-        .next()
+    let method = Method::from_bytes(
+        parsed
+            .method
+            .ok_or(ParseError::BadRequest("missing method"))?
+            .as_bytes(),
+    )
+    .map_err(|_| ParseError::BadRequest("invalid method token"))?;
+    let target = parsed
+        .path
         .ok_or(ParseError::BadRequest("missing request target"))?;
-    let version = parts
-        .next()
-        .ok_or(ParseError::BadRequest("missing version"))?;
-
-    if parts.next().is_some() || method.is_empty() || target.is_empty() {
-        return Err(ParseError::BadRequest("malformed request line"));
-    }
-
-    if !method.bytes().all(is_tchar) {
-        return Err(ParseError::BadRequest("invalid method token"));
-    }
-
-    let version = match version {
-        "HTTP/1.0" => Version::Http10,
-        "HTTP/1.1" => Version::Http11,
+    let uri = normalize_target(target)?;
+    let version = match parsed.version {
+        Some(0) => Version::HTTP_10,
+        Some(1) => Version::HTTP_11,
         _ => return Err(ParseError::BadRequest("unsupported HTTP version")),
     };
 
-    let path = normalize_path(target)?;
-    let mut headers = Vec::new();
-    let mut host_count = 0usize;
-    let mut content_length_values = Vec::new();
-    let mut transfer_encoding = None;
-    let mut connection_values = Vec::new();
+    let headers = convert_headers(parsed.headers)?;
 
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-
-        if matches!(line.first(), Some(b' ' | b'\t')) {
-            return Err(ParseError::BadRequest(
-                "obsolete line folding is not supported",
-            ));
-        }
-
-        if headers.len() >= config.max_headers {
-            return Err(ParseError::HeaderTooLarge);
-        }
-
-        let colon = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or(ParseError::BadRequest("header missing colon"))?;
-        let name = &line[..colon];
-        let value = trim_ows(&line[colon + 1..]);
-
-        if name.is_empty() || !name.iter().copied().all(is_tchar) {
-            return Err(ParseError::BadRequest("invalid header name"));
-        }
-
-        let name_text = std::str::from_utf8(name)
-            .map_err(|_| ParseError::BadRequest("header name must be ascii"))?;
-        let value_text = String::from_utf8_lossy(value).into_owned();
-
-        if name_text.eq_ignore_ascii_case("host") {
-            host_count += 1;
-        } else if name_text.eq_ignore_ascii_case("content-length") {
-            content_length_values.push(value_text.clone());
-        } else if name_text.eq_ignore_ascii_case("transfer-encoding") {
-            transfer_encoding = Some(value_text.clone());
-        } else if name_text.eq_ignore_ascii_case("connection") {
-            connection_values.push(value_text.clone());
-        }
-
-        headers.push(Header::new(name_text, value_text));
-    }
-
-    if version == Version::Http11 && host_count != 1 {
+    if version == Version::HTTP_11 && headers.get_all(HOST).iter().count() != 1 {
         return Err(ParseError::BadRequest(
             "HTTP/1.1 requests require exactly one Host header",
         ));
     }
 
-    let content_length = parse_content_length(&content_length_values)?;
+    let content_length = parse_content_length(&headers)?;
     let body_bytes = &bytes[head_end..];
+    let transfer_encoding_values = header_values(&headers, TRANSFER_ENCODING)?;
 
-    let (body, body_consumed) = match (transfer_encoding.as_deref(), content_length) {
-        (Some(_), Some(_)) => {
+    let (body, body_consumed) = match (!transfer_encoding_values.is_empty(), content_length) {
+        (true, Some(_)) => {
             return Err(ParseError::BadRequest(
                 "Transfer-Encoding and Content-Length cannot both be present",
             ))
         }
-        (Some(value), None) => {
-            if !is_chunked_transfer_encoding(value) {
+        (true, None) => {
+            if !is_chunked_transfer_encoding(&transfer_encoding_values) {
                 return Err(ParseError::NotImplemented(
                     "only Transfer-Encoding: chunked is supported",
                 ));
@@ -141,7 +97,7 @@ pub(crate) fn try_parse_request(
                 None => return Ok(None),
             }
         }
-        (None, Some(length)) => {
+        (false, Some(length)) => {
             if length > config.max_body_bytes {
                 return Err(ParseError::PayloadTooLarge);
             }
@@ -152,18 +108,16 @@ pub(crate) fn try_parse_request(
 
             (body_bytes[..length].to_vec(), length)
         }
-        (None, None) => (Vec::new(), 0),
+        (false, None) => (Vec::new(), 0),
     };
 
+    let connection_values = header_values(&headers, CONNECTION)?;
     let connection_close = should_close_connection(version, &connection_values);
-    let request = Request::new(
-        Method::new(method),
-        target.to_string(),
-        path,
-        version,
-        headers,
-        body,
-    );
+    let mut request = Request::new(body);
+    *request.method_mut() = method;
+    *request.uri_mut() = uri;
+    *request.version_mut() = version;
+    *request.headers_mut() = headers;
 
     Ok(Some(ParsedRequest {
         request,
@@ -172,29 +126,15 @@ pub(crate) fn try_parse_request(
     }))
 }
 
-fn normalize_path(target: &str) -> Result<String, ParseError> {
-    if target == "*" {
-        return Ok(String::from("*"));
-    }
-
-    if let Some(path) = target.strip_prefix('/') {
-        let path_end = path.find('?').unwrap_or(path.len());
-        return Ok(format!("/{}", &path[..path_end]));
-    }
-
-    if let Some(rest) = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))
+fn normalize_target(target: &str) -> Result<Uri, ParseError> {
+    if target == "*"
+        || target.starts_with('/')
+        || target.starts_with("http://")
+        || target.starts_with("https://")
     {
-        let slash_index = rest.find('/');
-        return Ok(match slash_index {
-            Some(index) => {
-                let suffix = &rest[index..];
-                let path_end = suffix.find('?').unwrap_or(suffix.len());
-                suffix[..path_end].to_string()
-            }
-            None => String::from("/"),
-        });
+        return target
+            .parse::<Uri>()
+            .map_err(|_| ParseError::BadRequest("invalid request target"));
     }
 
     Err(ParseError::BadRequest(
@@ -202,7 +142,22 @@ fn normalize_path(target: &str) -> Result<String, ParseError> {
     ))
 }
 
-fn parse_content_length(values: &[String]) -> Result<Option<usize>, ParseError> {
+fn convert_headers(raw_headers: &[httparse::Header<'_>]) -> Result<HeaderMap, ParseError> {
+    let mut headers = HeaderMap::with_capacity(raw_headers.len());
+
+    for header in raw_headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| ParseError::BadRequest("invalid header name"))?;
+        let value = HeaderValue::from_bytes(header.value)
+            .map_err(|_| ParseError::BadRequest("invalid header value"))?;
+        headers.append(name, value);
+    }
+
+    Ok(headers)
+}
+
+fn parse_content_length(headers: &HeaderMap) -> Result<Option<usize>, ParseError> {
+    let values = header_values(headers, CONTENT_LENGTH)?;
     if values.is_empty() {
         return Ok(None);
     }
@@ -232,21 +187,35 @@ fn parse_content_length(values: &[String]) -> Result<Option<usize>, ParseError> 
     Ok(parsed_value)
 }
 
-fn should_close_connection(version: Version, values: &[String]) -> bool {
+fn header_values<'a>(headers: &'a HeaderMap, name: HeaderName) -> Result<Vec<&'a str>, ParseError> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ParseError::BadRequest("header value must be visible ascii"))
+        })
+        .collect()
+}
+
+fn should_close_connection(version: Version, values: &[&str]) -> bool {
     let has_close = values.iter().any(|value| header_has_token(value, "close"));
     let has_keep_alive = values
         .iter()
         .any(|value| header_has_token(value, "keep-alive"));
 
     match version {
-        Version::Http11 => has_close,
-        Version::Http10 => !has_keep_alive,
+        Version::HTTP_11 => has_close,
+        Version::HTTP_10 => !has_keep_alive,
+        _ => true,
     }
 }
 
-fn is_chunked_transfer_encoding(value: &str) -> bool {
-    let mut tokens = value
-        .split(',')
+fn is_chunked_transfer_encoding(values: &[&str]) -> bool {
+    let mut tokens = values
+        .iter()
+        .flat_map(|value| value.split(','))
         .map(|token| token.trim())
         .filter(|token| !token.is_empty());
     matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("chunked"))
@@ -260,64 +229,18 @@ fn header_has_token(value: &str, wanted: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(wanted))
 }
 
-fn trim_ows(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t'))
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
-        .map(|index| index + 1)
-        .unwrap_or(start);
-    &bytes[start..end]
-}
-
-fn find_double_crlf(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn split_head_lines(head: &[u8]) -> Vec<&[u8]> {
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-
-    while let Some(offset) = head[start..]
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes[start..]
         .windows(2)
         .position(|window| window == b"\r\n")
-    {
-        let end = start + offset;
-        lines.push(&head[start..end]);
-        start = end + 2;
-    }
-
-    lines.push(&head[start..]);
-    lines
-}
-
-fn is_tchar(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'!' | b'#'
-            | b'$'
-            | b'%'
-            | b'&'
-            | b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'^'
-            | b'_'
-            | b'`'
-            | b'|'
-            | b'~'
-    ) || byte.is_ascii_alphanumeric()
+        .map(|position| start + position)
 }
 
 #[cfg(test)]
 mod tests {
     use super::try_parse_request;
-    use crate::types::{ParseError, ServerConfig, Version};
+    use crate::types::{ParseError, ServerConfig};
+    use crate::Version;
     use proptest::prelude::*;
 
     fn build_request(
@@ -346,9 +269,12 @@ mod tests {
         let parsed = try_parse_request(input, &config).unwrap().unwrap();
 
         assert_eq!(parsed.request.method().as_str(), "GET");
-        assert_eq!(parsed.request.path(), "/health");
-        assert_eq!(parsed.request.version(), Version::Http11);
-        assert_eq!(parsed.request.header("host"), Some("example.test"));
+        assert_eq!(parsed.request.uri().path(), "/health");
+        assert_eq!(parsed.request.version(), Version::HTTP_11);
+        assert_eq!(
+            parsed.request.headers().get("host").unwrap(),
+            "example.test"
+        );
         assert!(parsed.request.body().is_empty());
     }
 
@@ -434,7 +360,7 @@ mod tests {
 
             let parsed = parsed.expect("request should parse once all bytes are buffered");
             prop_assert_eq!(direct.request.method(), parsed.request.method());
-            prop_assert_eq!(direct.request.path(), parsed.request.path());
+            prop_assert_eq!(direct.request.uri(), parsed.request.uri());
             prop_assert_eq!(direct.request.body(), parsed.request.body());
             prop_assert_eq!(direct.consumed, parsed.consumed);
         }
@@ -486,7 +412,7 @@ mod tests {
             let config = ServerConfig::default();
             let parsed = try_parse_request(&request, &config).unwrap().unwrap();
 
-            prop_assert_eq!(parsed.request.path(), path);
+            prop_assert_eq!(parsed.request.uri().path(), path);
             prop_assert_eq!(parsed.request.body(), body.as_slice());
         }
 
@@ -571,8 +497,8 @@ mod tests {
             let config = ServerConfig::default();
             let parsed = try_parse_request(&request, &config).unwrap().unwrap();
 
-            prop_assert_eq!(parsed.request.path(), path);
-            prop_assert_eq!(parsed.request.target(), target);
+            prop_assert_eq!(parsed.request.uri().path(), path);
+            prop_assert_eq!(parsed.request.uri().to_string(), target);
         }
 
         #[test]

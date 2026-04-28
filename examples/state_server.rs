@@ -9,6 +9,15 @@ struct AppState {
     last_echo_body: String,
 }
 
+fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut response = Response::new(body.into().into_bytes());
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert("content-type", "text/plain; charset=utf-8".parse().unwrap());
+    response
+}
+
 fn main() -> std::io::Result<()> {
     let addr = "127.0.0.1:8080";
     let state = Arc::new(Mutex::new(AppState::default()));
@@ -22,10 +31,7 @@ fn main() -> std::io::Result<()> {
             let mut state = hello_state.lock().unwrap();
             state.hello_count += 1;
 
-            Response::text(
-                StatusCode::OK,
-                format!("hello {}", state.hello_count),
-            )
+            text_response(StatusCode::OK, format!("hello {}", state.hello_count))
         })
         .post("/echo", move |req| {
             let body = String::from_utf8_lossy(req.body()).into_owned();
@@ -35,8 +41,12 @@ fn main() -> std::io::Result<()> {
 
             println!("echo request {} body: {}", state.echo_count, body);
 
-            Response::bytes(StatusCode::OK, req.body().to_vec())
-                .header("content-type", "application/json")
+            let mut response = Response::new(req.body().to_vec());
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            response
         })
         .get("/stats", move |_req| {
             let state = stats_state.lock().unwrap();
@@ -45,8 +55,12 @@ fn main() -> std::io::Result<()> {
                 state.hello_count, state.echo_count, state.last_echo_body,
             );
 
-            Response::bytes(StatusCode::OK, body.into_bytes())
-                .header("content-type", "application/json")
+            let mut response = Response::new(body.into_bytes());
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            response
         });
 
     println!("listening on http://{}", addr);

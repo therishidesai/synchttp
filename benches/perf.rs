@@ -4,6 +4,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use http::header::CONTENT_TYPE;
+use http::HeaderValue;
 use synchttp::{Response, Router, Server, ServerConfig, StatusCode};
 
 #[derive(Clone)]
@@ -59,6 +61,22 @@ impl BenchServer {
     fn base_url(&self) -> &str {
         &self.base_url
     }
+}
+
+fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut response = Response::new(body.into().into_bytes());
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn bytes_response(status: StatusCode, body: impl Into<Vec<u8>>) -> Response {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response
 }
 
 impl Drop for BenchServer {
@@ -163,10 +181,13 @@ fn spawn_server() -> BenchServer {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
     let router = Router::new()
-        .get("/hello", |_req| Response::text(StatusCode::OK, "hello"))
+        .get("/hello", |_req| text_response(StatusCode::OK, "hello"))
         .post("/echo", |req| {
-            Response::bytes(StatusCode::OK, req.body().to_vec())
-                .header("content-type", "application/json")
+            let mut response = bytes_response(StatusCode::OK, req.body().to_vec());
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            response
         });
 
     let server = Server::bind("127.0.0.1:0")

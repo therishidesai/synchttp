@@ -1,6 +1,6 @@
 # synchttp
 
-`synchttp` is a small HTTP/1 server library in Rust built on `std` and `mio`.
+`synchttp` is a small HTTP/1 server library in Rust built on `std`, `http`, `httparse` and `mio`.
 
 It currently focuses on a single-threaded HTTP/1.1 server core with strict request parsing, buffered request bodies, and a minimal exact-path router.
 
@@ -38,12 +38,25 @@ synchttp = "0.1.0"
 use synchttp::{Response, Router, Server, StatusCode};
 
 fn main() -> std::io::Result<()> {
-    let router = Router::new()
-        .get("/health", |_req| Response::text(StatusCode::OK, "ok"))
-        .post("/echo", |req| Response::bytes(StatusCode::OK, req.body().to_vec()));
+    fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
+        let mut response = Response::new(body.into().into_bytes());
+        *response.status_mut() = status;
+        response.headers_mut().insert(
+            "content-type",
+            "text/plain; charset=utf-8".parse().unwrap(),
+        );
+        response
+    }
 
-    Server::bind("127.0.0.1:8080")?
-        .serve(router)
+    let router = Router::new()
+        .get("/health", |_req| text_response(StatusCode::OK, "ok"))
+        .post("/echo", |req| {
+            let mut response = Response::new(req.body().to_vec());
+            *response.status_mut() = StatusCode::OK;
+            response
+        });
+
+    Server::bind("127.0.0.1:8080")?.serve(router)
 }
 ```
 
@@ -53,24 +66,16 @@ fn main() -> std::io::Result<()> {
 - `Server::serve(router)` runs the event loop
 - `Router::new()` creates a router
 - `Router::get(...)`, `Router::post(...)`, and `Router::route(...)` register handlers
-- Handlers use the shape `FnMut(Request) -> Response`
+- Handlers use the shape `FnMut(Request<Vec<u8>>) -> Response<Vec<u8>>`
 
-Useful request helpers:
+The crate re-exports the core `http` types, so request/response handling uses the standard API:
 
 - `req.method()`
-- `req.path()`
-- `req.target()`
-- `req.header("host")`
+- `req.uri()`
+- `req.headers()`
 - `req.body()`
-
-Useful response helpers:
-
+- `Response::builder()`
 - `Response::new(...)`
-- `Response::ok()`
-- `Response::text(...)`
-- `Response::bytes(...)`
-- `.header(...)`
-- `.with_body(...)`
 
 ## Testing
 
